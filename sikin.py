@@ -1,6 +1,6 @@
+
 import streamlit as st
 import yfinance as yf
-import pandas_datareader.data as web
 import pandas as pd
 from datetime import datetime, timedelta
 
@@ -15,19 +15,29 @@ def fetch_macro_data():
     
     # 1. MOVE指数（債券ボラティリティ）の取得
     move_df = yf.download("^MOVE", start=start_date, end=end_date, progress=False)['Close']
+    if isinstance(move_df, pd.DataFrame):
+        move_df = move_df.squeeze()
+    move_df.index = move_df.index.tz_localize(None) # タイムゾーンの除去
     
-    # 2. BEI（10年ブレークイーブン・インフレ率）の取得 (FRED API)
-    bei_df = web.DataReader("T10YIE", "fred", start_date, end_date)
+    # 2. BEI（10年ブレークイーブン・インフレ率）の取得 (FREDから直接CSV取得)
+    bei_url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=T10YIE"
+    bei_df = pd.read_csv(bei_url, parse_dates=['DATE'], index_col='DATE', na_values='.')
+    bei_series = bei_df['T10YIE'].astype(float)
+    bei_series.index = bei_series.index.tz_localize(None)
     
     # 3. WTI原油先物（期近）の取得
-    # ※厳密なスプレッド(CL1!-CL2!)は無料APIでは欠損が多いため、期近の価格推移とモメンタムで代用します。
-    # 有料データフィード（IBKR等）をお持ちの場合は、ここをスプレッド取得処理に差し替えてください。
     wti_df = yf.download("CL=F", start=start_date, end=end_date, progress=False)['Close']
+    if isinstance(wti_df, pd.DataFrame):
+        wti_df = wti_df.squeeze()
+    wti_df.index = wti_df.index.tz_localize(None)
     
     # データフレームの結合と整形
-    df = pd.concat([move_df, bei_df, wti_df], axis=1)
+    df = pd.concat([move_df, bei_series, wti_df], axis=1)
     df.columns = ['MOVE', 'BEI', 'WTI']
-    df = df.ffill().dropna() # 欠損値の前方穴埋め
+    
+    # 指定期間でフィルタリングして欠損値を前方穴埋め
+    df = df.loc[start_date:end_date]
+    df = df.ffill().dropna()
     
     return df
 
@@ -43,6 +53,8 @@ def analyze_trend(series, short_window=5, long_window=20):
     is_downtrend = (current_val < ma_short) and (ma_short < ma_long)
     
     return current_val, delta, is_downtrend
+
+# --- 以降のコード（with st.spinner...以降）はそのまま残してください ---
 
 # データ取得
 with st.spinner('マクロデータを取得中...'):
