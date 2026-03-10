@@ -1,7 +1,8 @@
-
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import requests
+import io
 from datetime import datetime, timedelta
 
 # ページ設定
@@ -19,9 +20,14 @@ def fetch_macro_data():
         move_df = move_df.squeeze()
     move_df.index = move_df.index.tz_localize(None) # タイムゾーンの除去
     
-    # 2. BEI（10年ブレークイーブン・インフレ率）の取得 (FREDから直接CSV取得)
+    # 2. BEI（10年ブレークイーブン・インフレ率）の取得 (スクレイピング対策を突破)
     bei_url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=T10YIE"
-    bei_df = pd.read_csv(bei_url, parse_dates=['DATE'], index_col='DATE', na_values='.')
+    # 一般的なWebブラウザからのアクセスを装うヘッダー
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+    response = requests.get(bei_url, headers=headers)
+    
+    # 取得したテキストデータをPandasに読み込ませる
+    bei_df = pd.read_csv(io.StringIO(response.text), parse_dates=['DATE'], index_col='DATE', na_values='.')
     bei_series = bei_df['T10YIE'].astype(float)
     bei_series.index = bei_series.index.tz_localize(None)
     
@@ -53,8 +59,6 @@ def analyze_trend(series, short_window=5, long_window=20):
     is_downtrend = (current_val < ma_short) and (ma_short < ma_long)
     
     return current_val, delta, is_downtrend
-
-# --- 以降のコード（with st.spinner...以降）はそのまま残してください ---
 
 # データ取得
 with st.spinner('マクロデータを取得中...'):
