@@ -1,50 +1,51 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
 
 # ページ設定
 st.set_page_config(page_title="Macro Regime Monitor", layout="wide")
-st.title("マクロ先行指標 監視ダッシュボード")
+st.title("マクロ先行指標 監視ダッシュボード (Quant Mode)")
 
 @st.cache_data(ttl=3600)
 def fetch_macro_data():
     end_date = datetime.today()
-    start_date = end_date - timedelta(days=90)
+    # ボラティリティ計算用に少し長め（120日）にデータを取得
+    start_date = end_date - timedelta(days=120)
     
-    # 1. MOVE指数（債券ボラティリティ）
-    move_df = yf.download("^MOVE", start=start_date, end=end_date, progress=False)['Close']
-    if isinstance(move_df, pd.DataFrame):
-        move_df = move_df.squeeze()
-    move_df.index = move_df.index.tz_localize(None)
+    # ^TNX: 10年債利回り(MOVEプロキシ用), TIP: 物価連動債, IEF: 7-10年国債, CL=F: 原油, ^VIX: S&P500恐怖指数
+    tickers = ["^TNX", "TIP", "IEF", "CL=F", "^VIX"]
     
-    # 2. 期待インフレ率プロキシ (TIP/IEFレシオ)
-    # FREDのBEIの代わりに、インフレ連動債(TIP)と通常国債(IEF)の相対強度でインフレ期待を測定
-    tip_df = yf.download("TIP", start=start_date, end=end_date, progress=False)['Close']
-    ief_df = yf.download("IEF", start=start_date, end=end_date, progress=False)['Close']
-    if isinstance(tip_df, pd.DataFrame): tip_df = tip_df.squeeze()
-    if isinstance(ief_df, pd.DataFrame): ief_df = ief_df.squeeze()
-    
-    tip_df.index = tip_df.index.tz_localize(None)
-    ief_df.index = ief_df.index.tz_localize(None)
-    
-    # レシオの計算（この数値が上がればインフレ懸念増、下がればインフレ懸念後退）
-    bei_proxy = tip_df / ief_df
-    
-    # 3. WTI原油先物（期近）
-    wti_df = yf.download("CL=F", start=start_date, end=end_date, progress=False)['Close']
-    if isinstance(wti_df, pd.DataFrame):
-        wti_df = wti_df.squeeze()
-    wti_df.index = wti_df.index.tz_localize(None)
-    
-    # データフレームの結合と整形
-    df = pd.concat([move_df, bei_proxy, wti_df], axis=1)
-    df.columns = ['MOVE', 'BEI_Proxy', 'WTI']
-    
-    df = df.loc[start_date:end_date]
-    df = df.ffill().dropna()
-    
-    return df
+    try:
+        # yfinanceでの一括取得（最新仕様対応）
+        df_raw = yf.download(tickers, start=start_date, end=end_date, progress=False)['Close']
+        df_raw.index = df_raw.index.tz_localize(None)
+        df_raw = df_raw.ffill() # 欠損値の前方補完（NaN対策）
+        
+        df = pd.DataFrame(index=df_raw.index)
+        
+        # 1. MOVEプロキシ (10年債利回りのヒストリカル・ボラティリティ)
+        tnx_log_ret = np.log(df_raw['^TNX'] / df_raw['^TNX'].shift(1))
+        df['MOVE_Proxy'] = tnx_log_ret.rolling(window=20).std() * np.sqrt(252) * 100
+        
+        # 2. 期待インフレ率プロキシ (TIP/IEFレシオ)
+        df['BEI_Proxy'] = df_raw['TIP'] / df_raw['IEF']
+        
+        # 3. WTI原油先物
+        df['WTI'] = df_raw['CL=F']
+        
+        # 4. VIXとその加速度（2階微分）
+        df['VIX'] = df_raw['^VIX']
+        df['VIX_Velocity'] = df['VIX'] - df['VIX'].shift(3) # 速度 (3日差分)
+        df['VIX_Acceleration'] = df['VIX_Velocity'] - df['VIX_Velocity'].shift(3) # 加速度
+        
+        # 直近90日分のみを返す
+        return df.dropna().tail(90)
+        
+    except Exception as e:
+        st.error(f"データ取得エラー: {e}")
+        return pd.DataFrame()
 
 def analyze_trend(series, short_window=5, long_window=20):
     """数日〜数週間のトレンドを判定するロジック"""
@@ -55,63 +56,58 @@ def analyze_trend(series, short_window=5, long_window=20):
     
     delta = current_val - prev_val
     is_downtrend = (current_val < ma_short) and (ma_short < ma_long)
-    
-    return current_val, delta, is_downtrend
+    return float(current_val), float(delta), is_downtrend
 
-# データ取得
-with st.spinner('マクロデータを取得中...'):
+# データ取得の実行
+with st.spinner('マクロデータを取得・計算中...'):
     data = fetch_macro_data()
 
 if not data.empty:
-    move_val, move_delta, move_safe = analyze_trend(data['MOVE'])
+    move_val, move_delta, move_safe = analyze_trend(data['MOVE_Proxy'])
     bei_val, bei_delta, bei_safe = analyze_trend(data['BEI_Proxy'])
     wti_val, wti_delta, wti_safe = analyze_trend(data['WTI'])
     
-    # --- レジーム（環境）判定ロジック ---
-    if move_safe and bei_safe:
-        regime_status = "🟢 RISK ON (株式市場への資金流入環境)"
-        regime_color = "normal"
-    elif not move_safe and not bei_safe:
-        regime_status = "🔴 RISK OFF (ポジション縮小・警戒環境)"
-        regime_color = "inverse"
+    # --- VIX加速度判定ロジック ---
+    vix_val = data['VIX'].iloc[-1]
+    vix_vel = data['VIX_Velocity'].iloc[-1]
+    vix_accel = data['VIX_Acceleration'].iloc[-1]
+    
+    if vix_accel < 0 and vix_vel < 0:
+        vix_status = "🟢 緑 (ボラティリティ完全減衰・打診買い許可)"
+    elif vix_accel > 0 and vix_vel < 0:
+        vix_status = "🟡 薄い赤 (ボラティリティ残存・待機)"
     else:
-        regime_status = "🟡 NEUTRAL (トレンド転換の待機・個別銘柄選別環境)"
-        regime_color = "off"
+        vix_status = "🔴 赤 (ショック進行中・完全静観)"
+    
+    # --- 全体レジーム判定 ---
+    if move_safe and bei_safe and ("🟢" in vix_status):
+        regime_status = "🟢 RISK ON (純粋α銘柄へのエントリー環境)"
+    elif not move_safe and not bei_safe:
+        regime_status = "🔴 RISK OFF (全ポジションの縮小・ヘッジ環境)"
+    else:
+        regime_status = "🟡 NEUTRAL (トレンド転換の待機・相対的強度の監視環境)"
 
     st.subheader(f"現在のマクロレジーム: {regime_status}")
+    st.markdown(f"**VIX 加速度シグナル:** {vix_status}")
     st.markdown("---")
     
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.metric(
-            label="MOVE指数 (債券VIX)", 
-            value=f"{move_val:.2f}", 
-            delta=f"{move_delta:.2f}",
-            delta_color="inverse"
-        )
-        st.caption("※低下トレンドであれば株式のバリュエーションは正当化されます")
-        st.line_chart(data['MOVE'].tail(30))
+        st.metric(label="MOVEプロキシ (債券VIX)", value=f"{move_val:.2f}", delta=f"{move_delta:.2f}", delta_color="inverse")
+        st.line_chart(data['MOVE_Proxy'].tail(30))
 
     with col2:
-        st.metric(
-            label="インフレ期待プロキシ (TIP/IEFレシオ)", 
-            value=f"{bei_val:.4f}", 
-            delta=f"{bei_delta:.4f}",
-            delta_color="inverse"
-        )
-        st.caption("※低下トレンドであれば利上げ圧力は後退します")
+        st.metric(label="インフレ期待 (TIP/IEF)", value=f"{bei_val:.4f}", delta=f"{bei_delta:.4f}", delta_color="inverse")
         st.line_chart(data['BEI_Proxy'].tail(30))
 
     with col3:
-        st.metric(
-            label="WTI原油先物 (期近) $", 
-            value=f"{wti_val:.2f}", 
-            delta=f"{wti_delta:.2f}",
-            delta_color="inverse"
-        )
-        st.caption("※急騰リスクが剥落しているかを確認します")
+        st.metric(label="WTI原油先物 ($)", value=f"{wti_val:.2f}", delta=f"{wti_delta:.2f}", delta_color="inverse")
         st.line_chart(data['WTI'].tail(30))
+        
+    with col4:
+        st.metric(label="VIX (S&P500恐怖指数)", value=f"{float(vix_val):.2f}", delta=f"{float(vix_vel):.2f} (速度)", delta_color="inverse")
+        st.line_chart(data['VIX'].tail(30))
 
 else:
-    st.error("データの取得に失敗しました。")
+    st.error("データの取得に失敗しました。ネットワーク接続と yfinance のバージョンを確認してください。")
