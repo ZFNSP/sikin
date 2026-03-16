@@ -11,40 +11,54 @@ st.title("マクロ先行指標 監視ダッシュボード (Quant Mode)")
 @st.cache_data(ttl=3600)
 def fetch_macro_data():
     end_date = datetime.today()
-    # ボラティリティ計算用に少し長め（120日）にデータを取得
+    # ボラティリティ計算用に長め（120日）にデータを取得
     start_date = end_date - timedelta(days=120)
     
-    # ^TNX: 10年債利回り(MOVEプロキシ用), TIP: 物価連動債, IEF: 7-10年国債, CL=F: 原油, ^VIX: S&P500恐怖指数
-    tickers = ["^TNX", "TIP", "IEF", "CL=F", "^VIX"]
+    # 取得ティッカーの定義
+    tickers = {
+        "TNX": "^TNX",  # 10年債利回り
+        "TIP": "TIP",   # 物価連動債
+        "IEF": "IEF",   # 7-10年国債
+        "WTI": "CL=F",  # 原油
+        "VIX": "^VIX"   # S&P500恐怖指数
+    }
+    
+    df = pd.DataFrame()
     
     try:
-        # yfinanceでの一括取得（最新仕様対応）
-        df_raw = yf.download(tickers, start=start_date, end=end_date, progress=False)['Close']
-        df_raw.index = df_raw.index.tz_localize(None)
-        df_raw = df_raw.ffill() # 欠損値の前方補完（NaN対策）
-        
-        df = pd.DataFrame(index=df_raw.index)
-        
+        # 1つずつ独立して確実に取得する（エラー耐性の強化）
+        for name, ticker in tickers.items():
+            tkr = yf.Ticker(ticker)
+            hist = tkr.history(start=start_date, end=end_date)
+            if not hist.empty:
+                df[name] = hist['Close']
+            else:
+                st.warning(f"⚠️ {name} ({ticker}) のデータがAPIから返されませんでした。")
+                
+        if df.empty:
+            return pd.DataFrame()
+
+        # タイムゾーン情報の削除と欠損値の前方補完
+        df.index = df.index.tz_localize(None)
+        df = df.ffill()
+
+        # --- クオンツ指標の独自計算エンジン ---
         # 1. MOVEプロキシ (10年債利回りのヒストリカル・ボラティリティ)
-        tnx_log_ret = np.log(df_raw['^TNX'] / df_raw['^TNX'].shift(1))
+        tnx_log_ret = np.log(df['TNX'] / df['TNX'].shift(1))
         df['MOVE_Proxy'] = tnx_log_ret.rolling(window=20).std() * np.sqrt(252) * 100
         
         # 2. 期待インフレ率プロキシ (TIP/IEFレシオ)
-        df['BEI_Proxy'] = df_raw['TIP'] / df_raw['IEF']
+        df['BEI_Proxy'] = df['TIP'] / df['IEF']
         
-        # 3. WTI原油先物
-        df['WTI'] = df_raw['CL=F']
-        
-        # 4. VIXとその加速度（2階微分）
-        df['VIX'] = df_raw['^VIX']
+        # 3. VIXとその加速度（2階微分）の計算
         df['VIX_Velocity'] = df['VIX'] - df['VIX'].shift(3) # 速度 (3日差分)
         df['VIX_Acceleration'] = df['VIX_Velocity'] - df['VIX_Velocity'].shift(3) # 加速度
         
-        # 直近90日分のみを返す
+        # NaNを落とし、直近90日分を返す
         return df.dropna().tail(90)
         
     except Exception as e:
-        st.error(f"データ取得エラー: {e}")
+        st.error(f"データ計算エンジン内部で致命的エラーが発生しました: {e}")
         return pd.DataFrame()
 
 def analyze_trend(series, short_window=5, long_window=20):
